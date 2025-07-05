@@ -1,4 +1,5 @@
 #!/bin/bash
+# 020507051235
 
 # 检查是否以root权限运行
 if [ "$EUID" -ne 0 ]; then
