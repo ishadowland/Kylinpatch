@@ -266,18 +266,34 @@ cat /etc/yum.repos.d/local.repo >> "$LOG_FILE"
 
 # 8. 清理YUM缓存
 log "INFO" "### 步骤 7: 清理YUM缓存..."
-yum clean all >> "$LOG_FILE" 2>&1
-yum makecache >> "$LOG_FILE" 2>&1
+yum clean all >> "$LOG_FILE" 2>&1 || {
+    log "ERROR" "yum缓存清理失败"
+    exit 1
+}
+
+# 9. 重建YUM缓存
+log "INFO" "### 步骤 8: 重建YUM缓存..."
+yum makecache >> "$LOG_FILE" 2>&1 || {
+    log "ERROR" "yum缓存重建失败"
+    exit 1
+}
 
 # 9. 检查可用更新
-log "INFO" "### 步骤 8: 检查可用更新..."
-yum check-update >> "$LOG_FILE" 2>&1
+log "INFO" "### 步骤 9: 检查可用更新..."
+yum check-update >> "$LOG_FILE" 2>&1 || {
+    log "WARNING" "检查更新时出现警告，继续执行"
+    # 此处使用WARNING级别并继续执行，因为check-update返回非零可能只是没有更新
+}
 log "INFO" "检查更新完成"
 
 # 10. 执行升级
-log "INFO" "### 步骤 9: 执行系统升级..."
+log "INFO" "### 步骤 10: 执行系统升级..."
 log "INFO" "开始升级..."
 yum -y --color=always upgrade --nobest 2>&1 | tee -a "$LOG_FILE"
+if [ ${PIPESTATUS[0]} -ne 0 ]; then
+    log "ERROR" "系统升级过程失败"
+    exit 1
+fi
 log "INFO" "升级完成"
 
 # 11. 重启确认

@@ -30,6 +30,7 @@ if [ ! -f "/etc/.kyinfo" ]; then
     echo -e "${RED}错误：/etc/.kyinfo 文件不存在，无法获取系统信息${NC}" >&2
     exit 1
 fi
+#TODO: 在此处增加检查初始的yums.repo配置，记录原始下载路径以备比对
 
 # 从/etc/.kyinfo中提取所需信息
 echo -e "${YELLOW}[步骤2/9] 提取系统信息...${NC}"
@@ -76,7 +77,6 @@ printf "${BLUE}%-15s: ${NC}%s\n" "信息文件" "$infofile"
 printf "${BLUE}%-15s: ${NC}%s\n" "MD5校验文件" "$md5file"
 
 # 检查并卸载 mariadb
-# 检查并卸载 mariadb
 if rpm -qa | grep -q "^mariadb"; then
     echo -e "${YELLOW}检测到 mariadb，开始卸载...${NC}"
     
@@ -102,6 +102,7 @@ if rpm -qa | grep -q "^mariadb"; then
     fi
 fi
 # 清理旧目录
+
 echo -e "${YELLOW}[步骤3/9] 清理旧目录...${NC}"
 rm -rf ${TARGET_DIR}/
 [ $? -eq 0 ] && echo -e "${GREEN}旧目录清理完成${NC}" || echo -e "${YELLOW}警告：清理旧目录时出现问题${NC}" >&2
@@ -145,7 +146,6 @@ cd ${TARGET_DIR}/
 echo "建本地仓库..."
 if ! command -v createrepo &>/dev/null; then
     yum install -y createrepo && echo "createrepo安装成功" || { echo "错误：createrepo安装失败"; exit 1; }
-    exit 1
 fi
 
 createrepo ${TARGET_DIR}
