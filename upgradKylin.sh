@@ -69,15 +69,13 @@ if [ -f "$KYINFO_FILE" ]; then
     cat "$KYINFO_FILE" | tee -a "$LOG_FILE"
     
     # 提取关键信息
-    OS_NAME=$(grep '^name=' "$KYINFO_FILE" | cut -d= -f2 | tr -d '"')
-    OS_VERSION=$(grep '^version=' "$KYINFO_FILE" | cut -d= -f2 | tr -d '"')
-    OS_MILESTONE=$(grep '^milestone=' "$KYINFO_FILE" | cut -d= -f2 | tr -d '"')
-    OS_ARCH=$(grep '^arch=' "$KYINFO_FILE" | cut -d= -f2 | tr -d '"')
+    OS_NAME=$(grep '^[[:space:]]*name=' "$KYINFO_FILE" | sed 's/^[[:space:]]*name=[[:space:]]*//' | tr -d '"')
+    OS_MILESTONE=$(grep '^[[:space:]]*milestone=' "$KYINFO_FILE" | sed 's/^[[:space:]]*milestone=[[:space:]]*//' | tr -d '"')
+    OS_ARCH=$(grep '^[[:space:]]*arch=' "$KYINFO_FILE" | sed 's/^[[:space:]]*arch=[[:space:]]*//' | tr -d '"')
     
     log "INFO" "----------------------------------------"
     log "INFO" "系统摘要信息:"
     log "INFO" "操作系统名称: $OS_NAME"
-    log "INFO" "版本号: $OS_VERSION"
     log "INFO" "里程碑: $OS_MILESTONE"
     log "INFO" "系统架构: $OS_ARCH"
 else
@@ -290,7 +288,7 @@ log "INFO" "检查更新完成"
 # 10. 执行升级
 log "INFO" "### 步骤 10: 执行系统升级..."
 log "INFO" "开始升级..."
-yum -y --color=always upgrade --nobest 2>&1 | tee -a "$LOG_FILE"
+yum -y --color=always update 2>&1 | tee -a "$LOG_FILE"
 if [ ${PIPESTATUS[0]} -ne 0 ]; then
     log "ERROR" "系统升级过程失败"
     exit 1
