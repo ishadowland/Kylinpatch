@@ -11,6 +11,7 @@
 | `upgradKylin.sh`        | 用 `KylinUpgrade*.tar.gz` 升级系统 |
 | `downloadPatchByDate.sh` | 按日期筛选并补充下载源站上的 RPM |
 | `mergeAndUpgrade.sh`     | 把补充下载的 RPM 合并进旧工作目录并重新升级 |
+| `php2shell_scan.sh`      | PHP2Shell 漏洞风险只读扫描（CVE-2026-109618 / 109619） |
 
 ---
 
@@ -122,6 +123,33 @@ sudo ./mergeAndUpgrade.sh [选项]
 
 从源站下载**所有** RPM 并生成 YUM 本地仓库（按包名去重保留最新版）。适合离线场景。
 
+### `php2shell_scan.sh`
+
+PHP2Shell 漏洞风险**只读**扫描器。PHP 官方于 2026-10-21 披露 CVE-2026-109618（OOM 内存破坏）与 CVE-2026-109619（陈旧全局状态 UAF），两者 CVSS v4.0 均为 9.2，未认证即可 RCE。
+
+```bash
+./php2shell_scan.sh [选项]
+
+选项:
+  --log FILE        指定报告输出文件（默认 /var/log/php2shell_scan_<时间戳>.log）
+  --web-root DIR    追加扫描的 Web 根目录，可多次使用
+  --deep            深度模式：用 docker run 探测镜像内真实 PHP 版本
+  --skip-docker     跳过容器扫描
+  --skip-web        跳过 Web 目录扫描
+  --max-depth N     Web 目录递归深度，默认 6
+  --no-color        关闭彩色输出
+  -h, --help        查看帮助
+
+退出码: 0=无 CRIT/HIGH 风险  1=发现 CRIT/HIGH 风险  2=执行错误
+```
+
+- **只读**：不安装软件、不启停服务、不改配置、不动业务数据；唯一写入是报告日志文件
+- 扫描维度：操作系统基线 / 包管理器与 PHP 软件包 / PHP 运行时（CLI·FPM·CGI，含 systemd `ExecStart` 里的源码编译安装）/ 历史高危 CVE（2019-11043、2024-4577）/ Web 服务与 LAMP 组件 / php.ini 与 FPM pool 暴露面 / Web 目录演示文件与源码泄露 / Docker 镜像与容器
+- 版本判定对齐官方修复版本：8.2→8.2.35、8.3→8.3.36、8.4→8.4.27、8.5→8.5.12；8.1 及更早上游已停止维护，提示需确认发行版是否回补
+- 缓解措施按 PHP 官方公告给出，其中 `memory_limit=-1`（应用不可覆盖）与 `session.upload_progress.enabled=0` 是官方明列的两条，**不要把 `memory_limit` 调小**，有限上限反而提供了攻击者可控的 longjmp 中止路径
+- 兼容 bash 3.x（CentOS 7 / 麒麟 V10 等），并规避了 bash 3.2 无法解析命令替换内 `case` 语句的语法限制
+- 兼容麒麟 V10 / CentOS 7,8 / RHEL / SUSE 11,12 / Debian 系，无 docker / ss / systemctl 时自动降级
+
 ---
 
 ## 文件布局
@@ -133,6 +161,7 @@ Kylinpatch/
 ├── mergeAndUpgrade.sh       # 合并并升级
 ├── upgradKylin.sh           # 升级
 ├── getLocalRepo.sh          # 全量下载并生成 repo
+├── php2shell_scan.sh        # PHP2Shell 漏洞风险只读扫描
 └── README.md
 ```
 
