@@ -1,6 +1,6 @@
 #!/bin/bash
 #===============================================================================
-# php2shell_scan.sh  (v3.0.0)
+# php2shell_scan.sh  (v3.1.0)
 #-------------------------------------------------------------------------------
 # 用途：PHP2Shell 漏洞风险扫描器（只读，不修改系统、不安装任何软件）
 #
@@ -37,6 +37,22 @@
 #       所有遍历均使用 for 循环，避免管道子 shell 导致风险计数丢失
 #
 # 用法：bash php2shell_scan.sh [选项]   （详见 --help）
+#
+# v3.1.0 变更（对应 issue #3 - #12，均已在麒麟 V10 + Docker 18.09 + podman 0.10.1 上验证）：
+#   #3  session.upload_progress.enabled 缺失/被注释时不再静默，按"默认 1/On"判定为未落实；
+#       同时新增 ini_bool 归一化 On/Off/1/0，修复 display_errors / expose_php / opcache 判定
+#   #4  FPM 9000 暴露不再被第 5 节（端口）与第 6 节（pool 配置）重复计数，风险条目统一由
+#       pool listen 判定给出；未找到对应 pool 配置时才在第 6 节兜底告警
+#   #5  收集 Web 根目录时剔除嵌套子目录（如 /var/www/html），同一批文件不再被重复扫描
+#   #6  应用指纹识别要求文件非空 / 目录非空，空文件不再被判定为 WordPress 等应用
+#   #7  镜像 tag 版本解析优先取 php 关键字后的版本号，避免把应用版本（如 6.4）当 PHP 版本
+#   #8  容器实例不再按名称过滤，并新增"运行中容器内 php -v"只读探测，非 php 命名的
+#       WordPress 等容器不再漏检
+#   #9  演示/测试文件名黑名单增加二次判定（路径 + 内容），应用自带文件不再误报 HIGH
+#   #10 结论增加"待确认"档，仅命中中危项时不再输出"安全/不存在攻击面"
+#   #11 --deep 改为显式 create + start -a + rm -f，podman 0.10 下不再残留孤儿容器
+#   #12 phpize / php-config / phpdbg / phar 等辅助工具不再被当作 PHP 运行时
+#   另：CVE-2024-4577 判定补充 8.0 分支（修复版本 8.0.30）
 #===============================================================================
 
 #------------------------------- 默认配置 ---------------------------------------
@@ -69,6 +85,7 @@ REMED_TOPICS=""
 VULN_FOUND=0              # 发现低于修复版本的 PHP
 NOFIX_FOUND=0             # 发现官方无修复分支的 PHP
 FPM_EXPOSED=0             # 发现对外监听的 FPM
+FPM_PORT_9000=0           # 发现 9000 端口处于监听（可能为 php-fpm，配置侧判定见第 6 节）
 MODPHP_FOUND=0            # 发现 mod_php 部署
 
 #------------------------------- 颜色与输出 -------------------------------------
@@ -313,6 +330,16 @@ report_php_version() {
 }
 
 #------------------------------- 采集工具 ---------------------------------------
+# phpize / php-config / phpdbg / phar 等是辅助工具，不能报告 PHP 版本，
+# 必须排除，否则会被误当作 PHP 运行时（例如 phpize -v 输出 "Can't find PHP headers"）
+is_php_helper_tool() {
+    local p="$1"
+    case "${p##*/}" in
+        phpize|php-config|phpdbg|phar|phpcp|phpize*|php-config*) return 0 ;;
+    esac
+    return 1
+}
+
 # 查找 PATH 中及常见目录下的 php 可执行文件
 find_php_bins() {
     local b
@@ -329,6 +356,7 @@ find_php_bins() {
              /usr/local/bin/php* /usr/local/sbin/php-fpm* /usr/local/sbin/php-cgi* \
              /usr/bin/php* /usr/sbin/php-fpm* /usr/sbin/php-cgi* /usr/lib/cgi-bin/php* \
              /opt/1panel/versions/*/php*/bin/php /www/server/php/*/bin/php; do
+        is_php_helper_tool "$p" && continue
         [ -x "$p" ] && printf '%s\n' "$p"
     done 2>/dev/null
     return 0
@@ -377,6 +405,17 @@ ini_get() {
     printf '%s' "$out"
 }
 
+# ini_bool VALUE -> 把 On/Off/True/False/1/0/yes/no 归一化为 1/0，无法识别返回空
+# php.ini 中布尔项既可能写成 On/Off，也可能写成 1/0，需要统一处理
+ini_bool() {
+    local v="$1"
+    case "$(printf '%s' "$v" | tr 'A-Z' 'a-z')" in
+        on|true|yes|1) printf '1' ;;
+        off|false|no|0) printf '0' ;;
+    esac
+    return 0
+}
+
 # size_to_bytes VALUE -> 归一化为字节数（支持 K/M/G 后缀与纯数字），失败返回空
 size_to_bytes() {
     local v="$1"
@@ -413,11 +452,17 @@ fpm_listen_exposed() {
 }
 
 # 从镜像名/标签中提取 PHP 版本号（可能只有主.次两段）
+# 重要：复合 tag（如 wordpress:6.4-php8.2-apache、wordpress:4.9.8-php5.6-apache）
+#       同时包含"应用版本"和"PHP 版本"，必须优先取 php 关键字后面的版本号，
+#       否则会把应用版本当成 PHP 版本，造成误报（6.4 -> 判为无修复分支）
+#       或漏报（4.9.8 -> 分支未知 -> 仅 INFO），详见 issue #7
 extract_image_version() {
     local img="$1" v=""
-    v=$(printf '%s' "$img" | awk -F: '{print $NF}' | grep -oE '[0-9]+(\.[0-9]+){1,2}' | head -n1)
+    # 优先：php 后面的版本号（php8.2 / php-8.2 / php_8.2 / php8.2.17）
+    v=$(printf '%s' "$img" | grep -oiE 'php[._-]?v?[0-9]+(\.[0-9]+){0,2}' \
+        | grep -oE '[0-9]+(\.[0-9]+){0,2}' | head -n1)
     if [ -z "$v" ]; then
-        v=$(printf '%s' "$img" | grep -oE '[0-9]+(\.[0-9]+){1,2}' | head -n1)
+        v=$(printf '%s' "$img" | awk -F: '{print $NF}' | grep -oE '[0-9]+(\.[0-9]+){1,2}' | head -n1)
     fi
     printf '%s' "$v"
 }
@@ -431,6 +476,32 @@ is_demo_php_name() {
             return 0 ;;
     esac
     return 1
+}
+
+# 对"命中文件名黑名单"的 PHP 文件做二次判定，输出：
+#   suspicious —— 含 phpinfo()/命令执行等可疑调用，属真正的信息泄露/攻击面
+#   bundled    —— 应用自带文件（核心/依赖/插件主文件），不应报风险
+#   candidate  —— 仅文件名可疑，需人工确认
+# 背景：WordPress 的 hello.php（Hello Dolly 插件）、wp-includes/.../shell.php（Diff 引擎）
+#       等合法文件与黑名单重名，旧实现一律报 HIGH 造成误报（见 issue #9）
+classify_demo_file() {
+    local f="$1"
+    # 1) 应用核心 / 依赖目录下的文件一律视为应用自带
+    case "$f" in
+        */wp-includes/*|*/vendor/*|*/node_modules/*|*/core/*|*/lib/*|*/libs/*|*/framework/*)
+            printf 'bundled'; return 0 ;;
+    esac
+    # 2) 排除注释行后检查是否含信息泄露 / 命令执行调用
+    if grep -vE '^[[:space:]]*(\*|//|#|/\*)' "$f" 2>/dev/null \
+        | grep -qiE '(phpinfo|eval|assert|system|shell_exec|passthru|proc_open|popen|exec)[[:space:]]*\('; then
+        printf 'suspicious'; return 0
+    fi
+    # 3) 带插件/包声明头文件特征，判定为应用自带
+    if grep -qiE 'Plugin Name:|@package|@author|@version|namespace[[:space:]]+[A-Za-z_\\]' "$f" 2>/dev/null; then
+        printf 'bundled'; return 0
+    fi
+    printf 'candidate'
+    return 0
 }
 
 #===============================================================================
@@ -578,7 +649,7 @@ scan_php_runtime() {
         [ -z "$b" ] && continue
         vline=$(php_bin_version "$b")
         if [ -z "$vline" ]; then
-            log INFO "PHP" "  $b -> 版本读取失败（可能为损坏安装或权限不足）"
+            log INFO "PHP" "  $b -> 版本读取失败（该文件可能不是 PHP 运行时，或安装损坏 / 权限不足）"
             continue
         fi
         log INFO "PHP" "  $b -> $vline"
@@ -635,6 +706,7 @@ scan_extra_cves() {
                     8.3) if ver_lt "$v" "8.3.8"; then hits=1; add_topic "upgrade"; add_topic "cgi_mode"; high "CVE-2024-4577" "$b 版本 $v 的 CGI 模式存在 CVE-2024-4577 参数注入风险"; fi ;;
                     8.2) if ver_lt "$v" "8.2.20"; then hits=1; add_topic "upgrade"; add_topic "cgi_mode"; high "CVE-2024-4577" "$b 版本 $v 的 CGI 模式存在 CVE-2024-4577 参数注入风险"; fi ;;
                     8.1) if ver_lt "$v" "8.1.29"; then hits=1; add_topic "upgrade"; add_topic "cgi_mode"; high "CVE-2024-4577" "$b 版本 $v 的 CGI 模式存在 CVE-2024-4577 参数注入风险"; fi ;;
+                    8.0) if ver_lt "$v" "8.0.30"; then hits=1; add_topic "upgrade"; add_topic "cgi_mode"; high "CVE-2024-4577" "$b 版本 $v 的 CGI 模式存在 CVE-2024-4577 参数注入风险"; fi ;;
                     7.*|5.*|6.*) hits=1; add_topic "upgrade"; add_topic "cgi_mode"; high "CVE-2024-4577" "$b 版本 $v 所属分支已停止维护，CGI 模式存在 CVE-2024-4577 参数注入风险且无官方修复" ;;
                 esac
                 ;;
@@ -754,13 +826,11 @@ scan_web_server() {
         log INFO "WEB" "关键监听端口:"
         for p in $ports; do log INFO "WEB" "  $p"; done
         if printf '%s' "$ports" | grep -q ':9000'; then
-            FPM_EXPOSED=1
+            # 端口视角与 pool 配置视角是同一风险（见 issue #4）：
+            # 此处只做提示，实际风险条目统一由第 6 节的 pool listen 判定给出，避免重复计数
+            FPM_PORT_9000=1
             add_topic "fpm_listen"
-            if [ "$VULN_FOUND" -eq 1 ]; then
-                high "WEB" "9000 端口处于监听状态，若为 php-fpm 且暴露于外网，可直接发起 FastCGI 协议攻击"
-            else
-                med "WEB" "9000 端口处于监听状态，若为 php-fpm 且暴露于外网，可直接发起 FastCGI 协议攻击（通用加固项）"
-            fi
+            info "WEB" "9000 端口处于监听状态，若为 php-fpm 且暴露于外网，可直接发起 FastCGI 协议攻击（实际风险条目见第 6 节 php-fpm pool listen 判定）"
         fi
     fi
 
@@ -803,18 +873,20 @@ scan_php_config() {
         log INFO "CFG" "-- $f --"
 
         # display_errors / expose_php —— 通用加固项，非 PHP2Shell 缓解措施
-        local de ep
+        local de ep deb epb
         de=$(ini_get 'display_errors' "$f")
         ep=$(ini_get 'expose_php' "$f")
-        if [ "$de" = "On" ]; then
+        deb=$(ini_bool "$de")
+        epb=$(ini_bool "$ep")
+        if [ "$deb" = "1" ]; then
             add_topic "ini_harden"
-            low "CFG" "$f: display_errors=On，错误信息直接回显（通用信息泄露风险；注意官方明确说明隐藏诊断信息并不能缓解 PHP2Shell）"
+            low "CFG" "$f: display_errors=${de}，错误信息直接回显（通用信息泄露风险；注意官方明确说明隐藏诊断信息并不能缓解 PHP2Shell）"
         fi
-        if [ "$ep" = "On" ]; then
+        if [ "$epb" = "1" ]; then
             add_topic "ini_harden"
-            low "CFG" "$f: expose_php=On，暴露 PHP 版本指纹（通用加固项）"
+            low "CFG" "$f: expose_php=${ep}，暴露 PHP 版本指纹（通用加固项）"
         fi
-        if [ "$de" = "Off" ] && [ "$ep" = "Off" ]; then
+        if [ "$deb" = "0" ] && [ "$epb" = "0" ]; then
             ok "CFG" "$f: display_errors / expose_php 均已关闭"
         fi
 
@@ -834,23 +906,30 @@ scan_php_config() {
         fi
 
         # OPcache —— 官方缓解措施中未包含"关闭 OPcache"，仅作为暴露面提示
-        local oc omt
+        local oc omt ocb
         oc=$(ini_get 'opcache.enable' "$f")
         omt=$(ini_get 'opcache.validate_timestamps' "$f")
-        if [ "$oc" = "1" ]; then
+        ocb=$(ini_bool "$oc")
+        if [ "$ocb" = "1" ]; then
             add_topic "opcache"
             info "CFG" "$f: opcache.enable=1，OPcache 跨请求共享内存处于启用状态（提示项：官方缓解措施未包含关闭 OPcache，禁用前请评估业务性能影响）"
         fi
         log INFO "CFG" "$f: opcache.enable=${oc:-未设置}, opcache.validate_timestamps=${omt:-未设置}"
 
         # session.upload_progress —— CVE-2026-109619 官方缓解措施
-        local sup
+        # 注意：指令缺失或被注释（;session.upload_progress.enabled=On）时，PHP 采用默认值 1/On，
+        # 即缓解措施实际未落实。旧实现对这种情况不做任何提示，属于漏报（见 issue #3）。
+        local sup supb
         sup=$(ini_get 'session.upload_progress.enabled' "$f")
-        if [ "$sup" = "1" ]; then
+        supb=$(ini_bool "$sup")
+        if [ "$supb" = "1" ]; then
             add_topic "upload_progress"
-            med "CFG" "$f: session.upload_progress.enabled=1，官方缓解措施未落实（CVE-2026-109619：应设为 0 并重启所有 worker）"
-        elif [ "$sup" = "0" ]; then
-            ok "CFG" "$f: session.upload_progress.enabled=0，符合 CVE-2026-109619 官方缓解措施"
+            med "CFG" "$f: session.upload_progress.enabled=${sup}，官方缓解措施未落实（CVE-2026-109619：应设为 0 并重启所有 worker）"
+        elif [ "$supb" = "0" ]; then
+            ok "CFG" "$f: session.upload_progress.enabled=${sup}，符合 CVE-2026-109619 官方缓解措施"
+        else
+            add_topic "upload_progress"
+            med "CFG" "$f: 未显式设置 session.upload_progress.enabled（PHP 默认值为 1/On），官方缓解措施未落实（CVE-2026-109619：应设为 0 并重启所有 worker）"
         fi
 
         # post_max_size —— CVE-2026-109618 官方缓解措施（收紧请求体）
@@ -932,6 +1011,16 @@ scan_php_config() {
         done
         IFS="$oldifs"
     fi
+
+    # 兜底：9000 端口在监听，但未在任何 pool 配置中找到对应的 listen 声明
+    # （例如 pool 配置位于非标准路径、或由第三方面板生成）
+    if [ "$FPM_PORT_9000" -eq 1 ] && [ "$FPM_EXPOSED" -eq 0 ]; then
+        if [ "$VULN_FOUND" -eq 1 ]; then
+            high "WEB" "9000 端口处于监听状态且未找到对应的 php-fpm pool listen 配置，若为 php-fpm 且暴露于外网，可直接发起 FastCGI 协议攻击"
+        else
+            med "WEB" "9000 端口处于监听状态且未找到对应的 php-fpm pool listen 配置，请确认是否为对外暴露的 php-fpm（通用加固项）"
+        fi
+    fi
 }
 
 #===============================================================================
@@ -949,7 +1038,7 @@ scan_php_apps() {
 
     local oldifs="$IFS"
     IFS=$'\n'
-    local root total hits bak cms h b rdir
+    local root total hits bak cms h b rdir demo_files
     for root in $roots; do
         [ -d "$root" ] || continue
         rdir="${root%/}"         # 去掉末尾斜杠，避免输出 "路径//文件名"
@@ -959,15 +1048,42 @@ scan_php_apps() {
 
         # 演示 / 测试 / 信息泄露页
         # 注意：case 语句不能写在 $( ) 内（bash 3.2 语法限制），改用 is_demo_php_name 函数
-        hits=$(find "$rdir" -maxdepth "$MAX_DEPTH" -type f -name '*.php' 2>/dev/null \
+        # 文件名命中黑名单只是"候选"，需再按路径与内容判定，避免把应用自带文件
+        # （如 WordPress 的 hello.php / wp-includes/.../shell.php）误判为高危（见 issue #9）
+        local cand sus_bundled demo_cand
+        cand=$(find "$rdir" -maxdepth "$MAX_DEPTH" -type f -name '*.php' 2>/dev/null \
                 | while IFS= read -r f; do
                     if is_demo_php_name "$(basename "$f")"; then
                         printf '%s\n' "$f"
                     fi
                 done)
-        if [ -n "$hits" ]; then
+        demo_files=""
+        demo_cand=""
+        sus_bundled=""
+        if [ -n "$cand" ]; then
+            local cf cver
+            oldifs="$IFS"; IFS=$'\n'
+            for cf in $cand; do
+                [ -z "$cf" ] && continue
+                cver=$(classify_demo_file "$cf")
+                case "$cver" in
+                    suspicious) demo_files="$demo_files$cf"$'\n' ;;
+                    bundled)    sus_bundled="$sus_bundled$cf"$'\n' ;;
+                    *)          demo_cand="$demo_cand$cf"$'\n' ;;
+                esac
+            done
+            IFS="$oldifs"
+        fi
+        if [ -n "$demo_files" ]; then
             add_topic "demo_files"
-            high "APP" "$rdir 存在疑似演示/测试/信息泄露 PHP 文件（可用于探测与放大漏洞）：$(printf '%s' "$hits" | tr '\n' ' ')"
+            high "APP" "$rdir 存在演示/测试 PHP 文件且含 phpinfo()/命令执行等可疑调用（可用于探测与放大漏洞）：$(printf '%s' "$demo_files" | tr '\n' ' ')"
+        fi
+        if [ -n "$demo_cand" ]; then
+            add_topic "demo_files"
+            med "APP" "$rdir 存在命中演示/测试文件名黑名单的文件（未发现明显可疑调用，请人工确认是否为遗留文件）：$(printf '%s' "$demo_cand" | tr '\n' ' ')"
+        fi
+        if [ -n "$sus_bundled" ]; then
+            info "APP" "$rdir 有 $(printf '%s' "$sus_bundled" | grep -c '[^[:space:]]') 个文件命中演示/测试文件名黑名单，但属应用自带文件（核心/依赖/插件主文件），已忽略：$(printf '%s' "$sus_bundled" | tr '\n' ' ')"
         fi
 
         # 备份 / 源码泄露文件
@@ -1014,31 +1130,59 @@ collect_web_roots() {
     )
     for d in $out; do
         [ -d "$d" ] && echo "$d"
+    done | remove_nested_roots
+    return 0
+}
+
+# 剔除被其它根目录包含的子目录，避免同一批文件被重复扫描、同一风险被重复计数
+# （例如 /var/www 与 /var/www/html 同时存在，见 issue #5）
+remove_nested_roots() {
+    local cand kept d other dn on
+    cand=$(cat)
+    IFS=$'\n'
+    for d in $cand; do
+        [ -z "$d" ] && continue
+        dn=${d%/}                      # 去掉末尾斜杠用于比较
+        [ -z "$dn" ] && dn="/"
+        kept=1
+        for other in $cand; do
+            [ -z "$other" ] && continue
+            on=${other%/}
+            [ -z "$on" ] && on="/"
+            [ "$dn" = "$on" ] && continue
+            # d 位于 other 之下（other 是 d 的祖先）-> 丢弃 d，保留上层根目录
+            case "$dn" in
+                "$on"/*) kept=0; break ;;
+            esac
+        done
+        [ "$kept" -eq 1 ] && printf '%s\n' "$d"
     done
     return 0
 }
 
 # 应用指纹识别
+# 注意：仅凭"文件/目录存在"判定会把 0 字节空文件、空目录误判为应用指纹（见 issue #6），
+# 因此所有判定都要求文件非空 / 目录非空
 detect_cms() {
     local root="$1" out=""
-    if [ -f "$root/wp-config.php" ]; then
+    if [ -f "$root/wp-config.php" ] && [ -s "$root/wp-config.php" ]; then
         out="$out WordPress"
-    elif [ -d "$root/wp-content" ]; then
+    elif [ -d "$root/wp-content" ] && [ -n "$(ls -A "$root/wp-content" 2>/dev/null | head -n1)" ]; then
         out="$out WordPress(content)"
     fi
-    [ -f "$root/configuration.php" ] && out="$out Joomla"
-    [ -f "$root/index.php" ] && [ -d "$root/core" ] && out="$out Drupal"
-    [ -f "$root/artisan" ] && out="$out Laravel"
-    [ -d "$root/thinkphp" ] && out="$out ThinkPHP"
-    [ -f "$root/think" ] && out="$out ThinkPHP"
-    [ -f "$root/composer.json" ] && out="$out Composer项目"
-    [ -f "$root/composer.lock" ] && out="$out Composer.lock"
-    [ -d "$root/phpmyadmin" ] && out="$out phpMyAdmin"
-    [ -d "$root/mediawiki" ] && out="$out MediaWiki"
-    [ -d "$root/yii" ] && out="$out Yii"
-    [ -f "$root/config.php" ] && [ -d "$root/sites" ] && out="$out Drupal(config)"
-    [ -d "$root/Discuz" ] && out="$out Discuz"
-    [ -f "$root/index.php" ] && [ -d "$root/admin" ] && out="$out 后台管理类应用"
+    [ -f "$root/configuration.php" ] && [ -s "$root/configuration.php" ] && out="$out Joomla"
+    [ -f "$root/index.php" ] && [ -d "$root/core" ] && [ -n "$(ls -A "$root/core" 2>/dev/null | head -n1)" ] && out="$out Drupal"
+    [ -f "$root/artisan" ] && [ -s "$root/artisan" ] && out="$out Laravel"
+    [ -d "$root/thinkphp" ] && [ -n "$(ls -A "$root/thinkphp" 2>/dev/null | head -n1)" ] && out="$out ThinkPHP"
+    [ -f "$root/think" ] && [ -s "$root/think" ] && out="$out ThinkPHP"
+    [ -f "$root/composer.json" ] && [ -s "$root/composer.json" ] && out="$out Composer项目"
+    [ -f "$root/composer.lock" ] && [ -s "$root/composer.lock" ] && out="$out Composer.lock"
+    [ -d "$root/phpmyadmin" ] && [ -n "$(ls -A "$root/phpmyadmin" 2>/dev/null | head -n1)" ] && out="$out phpMyAdmin"
+    [ -d "$root/mediawiki" ] && [ -n "$(ls -A "$root/mediawiki" 2>/dev/null | head -n1)" ] && out="$out MediaWiki"
+    [ -d "$root/yii" ] && [ -n "$(ls -A "$root/yii" 2>/dev/null | head -n1)" ] && out="$out Yii"
+    [ -f "$root/config.php" ] && [ -s "$root/config.php" ] && [ -d "$root/sites" ] && out="$out Drupal(config)"
+    [ -d "$root/Discuz" ] && [ -n "$(ls -A "$root/Discuz" 2>/dev/null | head -n1)" ] && out="$out Discuz"
+    [ -f "$root/index.php" ] && [ -d "$root/admin" ] && [ -n "$(ls -A "$root/admin" 2>/dev/null | head -n1)" ] && out="$out 后台管理类应用"
     printf '%s' "$out" | tr -s ' ' | sed 's/^ //'
     return 0
 }
@@ -1073,9 +1217,10 @@ scan_docker() {
     local oldifs="$IFS"
     IFS=$'\n'
     local imgs total i v verdict cs c
+    # 名称含 php 的镜像：可直接从 tag 推断 PHP 版本
     imgs=$($docker_bin images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep -i 'php' | sort -u)
     if [ -z "$imgs" ]; then
-        info "DOCKER" "未发现名称含 php 的本地镜像"
+        info "DOCKER" "未发现名称含 php 的本地镜像（名称不含 php 的镜像无法从 tag 推断版本，需 --deep 或容器内探测）"
     else
         total=$(printf '%s\n' "$imgs" | grep -c '[a-zA-Z]')
         info "DOCKER" "发现 $total 个 PHP 相关本地镜像，逐个判定版本："
@@ -1101,13 +1246,34 @@ scan_docker() {
         done
     fi
 
-    # 容器实例
-    cs=$($docker_bin ps -a --format '{{.Names}}	{{.Image}}	{{.Status}}' 2>/dev/null | grep -i 'php')
+    # 容器实例：不再按名称过滤（名称不含 php 的容器同样可能运行 PHP，见 issue #8）
+    cs=$($docker_bin ps -a --format '{{.Names}}	{{.Image}}	{{.Status}}' 2>/dev/null)
     if [ -n "$cs" ]; then
-        info "DOCKER" "发现使用 PHP 镜像的容器实例，需确认其镜像版本是否已修复："
+        info "DOCKER" "发现全部容器实例（名称不含 php 的容器也可能在运行 PHP）："
         for c in $cs; do log INFO "DOCKER" "  $c"; done
     else
-        info "DOCKER" "未发现使用 PHP 镜像的容器实例"
+        info "DOCKER" "未发现容器实例"
+    fi
+
+    # 运行中容器内 PHP 版本探测（只读：仅执行 php -v，不修改容器）
+    local running probe_name probe_img probe_ver
+    running=$($docker_bin ps --format '{{.Names}}' 2>/dev/null)
+    if [ -n "$running" ]; then
+        oldifs="$IFS"; IFS=$'\n'
+        for probe_name in $running; do
+            [ -z "$probe_name" ] && continue
+            probe_name="$probe_name"
+            if have timeout; then
+                probe_ver=$(timeout 5 $docker_bin exec "$probe_name" php -v 2>/dev/null | grep -i '^PHP' | head -n1)
+            else
+                probe_ver=$($docker_bin exec "$probe_name" php -v 2>/dev/null | grep -i '^PHP' | head -n1)
+            fi
+            [ -z "$probe_ver" ] && continue
+            log INFO "DOCKER" "  容器 $probe_name 内 PHP: $probe_ver"
+            report_php_version "$(printf '%s' "$probe_ver" | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1)" \
+                               "容器 $probe_name 内 PHP" "DOCKER"
+        done
+        IFS="$oldifs"
     fi
     IFS="$oldifs"
 
@@ -1120,11 +1286,19 @@ scan_docker() {
         for i in $all_imgs; do
             [ -z "$i" ] && continue
             probe_cnt=$((probe_cnt+1))
-            local iv pv
-            iv=$($docker_bin run --rm --network none --entrypoint php "$i" -v 2>/dev/null | head -n1)
+            local iv pv cid
+            # 显式 create + start + rm：podman 0.10 在 entrypoint 不存在时不会回收 --rm 容器，
+            # 会残留孤儿容器（见 issue #11）；此处改为显式持有容器 ID 并强制删除
+            cid=$($docker_bin create --network none --entrypoint php "$i" -v 2>/dev/null)
+            if [ -z "$cid" ]; then
+                continue
+            fi
+            iv=$($docker_bin start -a "$cid" 2>/dev/null | grep -i '^PHP' | head -n1)
+            $docker_bin rm -f "$cid" >/dev/null 2>&1
             [ -z "$iv" ] && continue
-            log INFO "DOCKER" "  镜像 $i 内 PHP: $iv"
             pv=$(printf '%s' "$iv" | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1)
+            [ -z "$pv" ] && continue
+            log INFO "DOCKER" "  镜像 $i 内 PHP: $iv"
             report_php_version "$pv" "镜像 $i 内 PHP" "DOCKER"
         done
         IFS="$oldifs"
@@ -1305,9 +1479,9 @@ print_remediation() {
 # 主流程
 #===============================================================================
 main() {
-    printf '%s\n' "$C_BLD==== PHP2Shell 漏洞风险扫描 (PHP2Shell Scan) v3.0.0 ====$C_OFF"
+    printf '%s\n' "$C_BLD==== PHP2Shell 漏洞风险扫描 (PHP2Shell Scan) v3.1.0 ====$C_OFF"
     log INFO "SCAN" "开始时间 $(date '+%Y-%m-%d %H:%M:%S')"
-    log INFO "SCAN" "主机 $(hostname 2>/dev/null)  执行身份 $(id -un 2>/dev/null)  扫描器版本 3.0.0"
+    log INFO "SCAN" "主机 $(hostname 2>/dev/null)  执行身份 $(id -un 2>/dev/null)  扫描器版本 3.1.0"
     log INFO "SCAN" "报告文件: $REPORT_FILE"
     log INFO "SCAN" "漏洞参考: CVE-2026-109618 (OOM 内存破坏) / CVE-2026-109619 (陈旧全局状态 UAF)"
 
@@ -1323,9 +1497,12 @@ main() {
     section "扫描结论"
 
     # ---- 总体判定 ----
+    # 存在中危项时不能直接判"安全"：结论必须与修复建议保持一致（见 issue #10）
     local verdict vcolor
     if [ "$CNT_CRIT" -gt 0 ] || [ "$CNT_HIGH" -gt 0 ]; then
         verdict="存在风险"; vcolor="$C_RED"
+    elif [ "$CNT_MED" -gt 0 ]; then
+        verdict="待确认"; vcolor="$C_YEL"
     else
         verdict="安全"; vcolor="$C_GRN"
     fi
@@ -1337,9 +1514,13 @@ main() {
         printf '  %s判定依据：存在 %s 项严重、%s 项高危风险，需立即处置（详见下方清单）。%s\n' \
             "$C_BLD" "$CNT_CRIT" "$CNT_HIGH" "$C_OFF"
         _log_target "  判定依据：存在 $CNT_CRIT 项严重、$CNT_HIGH 项高危风险，需立即处置"
+    elif [ "$CNT_MED" -gt 0 ]; then
+        printf '  %s判定依据：未发现严重(Critical)与高危(High)级风险，但存在 %s 项中危风险待人工复核（详见下方清单），本机仍可能构成 PHP2Shell 攻击面。%s\n' \
+            "$C_BLD" "$CNT_MED" "$C_OFF"
+        _log_target "  判定依据：未发现严重(Critical)与高危(High)级风险，但存在 $CNT_MED 项中危风险待人工复核，本机仍可能构成 PHP2Shell 攻击面"
     else
-        printf '  %s判定依据：未发现严重(Critical)与高危(High)级风险，本机不构成 PHP2Shell 攻击面。%s\n' "$C_BLD" "$C_OFF"
-        _log_target "  判定依据：未发现严重(Critical)与高危(High)级风险，本机不构成 PHP2Shell 攻击面"
+        printf '  %s判定依据：未发现严重(Critical)、高危(High)与中危(Medium)级风险，本机不构成 PHP2Shell 攻击面。%s\n' "$C_BLD" "$C_OFF"
+        _log_target "  判定依据：未发现严重(Critical)、高危(High)与中危(Medium)级风险，本机不构成 PHP2Shell 攻击面"
     fi
 
     printf '\n  %s风险统计%s  严重(Critical): %s  高危(High): %s  中危(Medium): %s  低危(Low): %s  提示(Info): %s\n' \
@@ -1371,8 +1552,12 @@ main() {
         printf '\n%s[结论] 存在风险：本机存在 %s 项严重、%s 项高危风险，请按上方清单与修复建议处置。%s\n' \
             "$C_RED$C_BLD" "$CNT_CRIT" "$CNT_HIGH" "$C_OFF"
         exit 1
+    elif [ "$CNT_MED" -gt 0 ]; then
+        printf '\n%s[结论] 待确认：未发现严重/高危风险，但存在 %s 项中危风险需人工复核确认，请参考上方清单与修复建议。%s\n' \
+            "$C_YEL$C_BLD" "$CNT_MED" "$C_OFF"
+        exit 0
     else
-        printf '\n%s[结论] 安全：未发现严重/高危风险，本机不存在 PHP2Shell 攻击面。%s\n' "$C_GRN$C_BLD" "$C_OFF"
+        printf '\n%s[结论] 安全：未发现严重/高危/中危风险，本机不存在 PHP2Shell 攻击面。%s\n' "$C_GRN$C_BLD" "$C_OFF"
         exit 0
     fi
 }
