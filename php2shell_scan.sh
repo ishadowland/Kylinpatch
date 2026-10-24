@@ -332,10 +332,13 @@ report_php_version() {
 #------------------------------- 采集工具 ---------------------------------------
 # phpize / php-config / phpdbg / phar 等是辅助工具，不能报告 PHP 版本，
 # 必须排除，否则会被误当作 PHP 运行时（例如 phpize -v 输出 "Can't find PHP headers"）
+# 另外扫描脚本自身（php2shell_scan.sh）若被安装到 /usr/local/bin 等目录，
+# 也会被 /usr/local/bin/php* 通配命中，同样需要排除
 is_php_helper_tool() {
     local p="$1"
     case "${p##*/}" in
         phpize|php-config|phpdbg|phar|phpcp|phpize*|php-config*) return 0 ;;
+        php2shell*|php2shell_scan*) return 0 ;;
     esac
     return 1
 }
