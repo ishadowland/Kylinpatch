@@ -1,6 +1,6 @@
 #!/bin/bash
 #===============================================================================
-# php2shell_scan.sh  (v3.1.0)
+# php2shell_scan.sh  (v3.2.0)
 #-------------------------------------------------------------------------------
 # 用途：PHP2Shell 漏洞风险扫描器（只读，不修改系统、不安装任何软件）
 #
@@ -37,6 +37,25 @@
 #       所有遍历均使用 for 循环，避免管道子 shell 导致风险计数丢失
 #
 # 用法：bash php2shell_scan.sh [选项]   （详见 --help）
+#
+# v3.2.0 变更（对应 issue #13：非 PATH 部署整机漏检）：
+#   背景：禅道 zbox 等一体化部署把 Apache / PHP / MySQL / Redis 全部放在
+#         /opt/<产品> 下，既不进 PATH、也不注册 systemd 服务（由自带的
+#         zbox 脚本管理）。旧版只按"发行版标准路径 + PATH"探测，于是整机被
+#         误判为"无 PHP 运行时 / 安全"，连 80 端口的 httpd 都没被识别。
+#   #13 a) 新增进程反查（/proc/<pid>/exe），按正在运行的进程定位 httpd /
+#          nginx / php 的真实二进制，覆盖任何非常规部署；
+#       b) PHP 候选路径补充 /opt/*/run/php、/opt/*/bin、/opt/lampp、
+#          宝塔 /www/server/php 等一体化布局；
+#       c) php.ini 改用 `php --ini` 的 "Loaded Configuration File" 定位，
+#          并加载其 conf.d 目录，不再依赖固定路径列表；
+#       d) Web 根目录改为解析 Apache 的 DocumentRoot 与 Alias 目标
+#          （如 Alias /zentao -> /opt/zbox/app/zentao/www/）；
+#       e) 应用指纹新增禅道（ZenTao）；
+#       f) 7.4 / 8.0 / 8.1 若不属于任何系统软件包（厂商自带 / 源码编译，
+#          无发行版回补渠道），由中危上调为高危；
+#       g) 新增常驻 PHP 应用进程识别（RoadRunner、队列 worker 等），
+#          补足 CVE-2026-109619 陈旧全局状态的暴露面。
 #
 # v3.1.0 变更（对应 issue #3 - #12，均已在麒麟 V10 + Docker 18.09 + podman 0.10.1 上验证）：
 #   #3  session.upload_progress.enabled 缺失/被注释时不再静默，按"默认 1/On"判定为未落实；
@@ -87,6 +106,14 @@ NOFIX_FOUND=0             # 发现官方无修复分支的 PHP
 FPM_EXPOSED=0             # 发现对外监听的 FPM
 FPM_PORT_9000=0           # 发现 9000 端口处于监听（可能为 php-fpm，配置侧判定见第 6 节）
 MODPHP_FOUND=0            # 发现 mod_php 部署
+
+# 进程反查缓存：用于识别不进 PATH、不注册 systemd 的一体化部署（禅道 zbox 等）
+PROC_CACHE_DONE=0
+PROC_HTTPD_LIST=""        # 运行中的 httpd / apache2 可执行文件绝对路径
+PROC_NGINX_LIST=""        # 运行中的 nginx 可执行文件绝对路径
+PROC_PHP_LIST=""          # 运行中的 php / php-fpm / php-cgi 可执行文件绝对路径
+PROC_PHP_WORKERS=""       # "pid|命令行" 形式的长驻 PHP 应用进程（RoadRunner / 队列 worker 等）
+PHP_BINS_FOUND=""         # 第 3 节实际发现的 PHP 可执行文件，供第 6 节定位 php.ini
 
 #------------------------------- 颜色与输出 -------------------------------------
 # 使用 ANSI-C 引用，生成真实 ESC 字符（$'\033' 为 bash 2.0+ 语法，兼容 bash 3.x）
@@ -312,7 +339,20 @@ report_php_version() {
         backport)
             VULN_FOUND=1
             add_topic "backport"
-            med "$kind" "$where 版本 $v 所属分支（$V_MAJ.$V_MIN）上游无修复发行版，需确认发行版是否回补"
+            # 7.4 / 8.0 / 8.1 上游已不再发布安全版本，唯一修复渠道是发行版回补。
+            # 若该二进制不属于任何发行版软件包（厂商自带一体化包 / 源码编译），
+            # 就不存在回补渠道，风险等同"无修复"，必须由中危上调为高危。
+            local bpath=""
+            case "$where" in
+                "运行时 "*) bpath="${where#运行时 }" ;;
+            esac
+            if [ -n "$bpath" ] && [ -x "$bpath" ] && ! bin_is_packaged "$bpath"; then
+                add_topic "vendor_php"
+                add_topic "upgrade"
+                high "$kind" "$where 版本 $v 所属分支（$V_MAJ.$V_MIN）上游无修复发行版，且该二进制不属于任何系统软件包（厂商自带/源码编译），没有回补渠道，等同无修复"
+            else
+                med "$kind" "$where 版本 $v 所属分支（$V_MAJ.$V_MIN）上游无修复发行版，需确认发行版是否回补"
+            fi
             ;;
         safe)
             ok "$kind" "$where 版本 $v 不低于该分支修复版本"
@@ -352,16 +392,25 @@ find_php_bins() {
             command -v "$b"
         fi
     done
-    # 常见安装位置（源码编译、自建、面板安装等）
+    # 常见安装位置（源码编译、自建、面板安装、一体化部署等）
+    # /opt/*/run/php、/opt/*/bin：禅道 zbox、XAMPP 类一体化包（无 bin 子目录）
     for p in /usr/local/php*/bin/php /usr/local/php-*/bin/php /usr/local/php*/bin/php-fpm \
              /usr/local/php-*/bin/php-fpm /usr/local/php*/bin/php-cgi /usr/local/php*/sbin/php-fpm \
              /opt/php*/bin/php /opt/php-*/bin/php /opt/php*/sbin/php-fpm \
+             /opt/*/run/php/php /opt/*/run/php/php-fpm /opt/*/run/php/php-cgi /opt/*/bin/php \
+             /opt/lampp/bin/php* /www/server/php/*/bin/php* \
              /usr/local/bin/php* /usr/local/sbin/php-fpm* /usr/local/sbin/php-cgi* \
              /usr/bin/php* /usr/sbin/php-fpm* /usr/sbin/php-cgi* /usr/lib/cgi-bin/php* \
              /opt/1panel/versions/*/php*/bin/php /www/server/php/*/bin/php; do
         is_php_helper_tool "$p" && continue
         [ -x "$p" ] && printf '%s\n' "$p"
     done 2>/dev/null
+    # 进程反查：覆盖不进 PATH、未注册 systemd 的一体化部署（禅道 zbox / XAMPP / 面板）
+    proc_cache_build
+    for p in $PROC_PHP_LIST; do
+        is_php_helper_tool "$p" && continue
+        [ -x "$p" ] && printf '%s\n' "$p"
+    done
     return 0
 }
 
@@ -388,10 +437,126 @@ find_php_bins_systemd() {
     return 0
 }
 
-# 输出 php 二进制版本首行
+# 建立"进程 -> 可执行文件"反查缓存
+# 背景：一体化部署（禅道 zbox、XAMPP、面板）把 httpd / php 放在 /opt 或 /www 下，
+#       既不在 PATH，也不注册 systemd 服务，唯一可靠的线索是正在运行的进程。
+#       缓存只构建一次，后续各节复用（子 shell 会继承已完成的标记与结果）。
+proc_cache_build() {
+    [ "$PROC_CACHE_DONE" -eq 1 ] && return 0
+    PROC_CACHE_DONE=1
+    local d pid exe base cmd
+    for d in /proc/[0-9]*; do
+        [ -d "$d" ] || continue
+        exe=$(readlink -f "$d/exe" 2>/dev/null)
+        [ -n "$exe" ] || exe=$(readlink "$d/exe" 2>/dev/null)
+        [ -n "$exe" ] || continue
+        # 二进制被覆盖/删除后 exe 会带 " (deleted)" 后缀，去掉后仍可用于定位目录
+        case "$exe" in
+            *" (deleted)") exe="${exe% (deleted)}" ;;
+        esac
+        base="${exe##*/}"
+        case "$base" in
+            httpd|apache2)
+                PROC_HTTPD_LIST="$PROC_HTTPD_LIST$exe"$'\n'
+                ;;
+            nginx)
+                PROC_NGINX_LIST="$PROC_NGINX_LIST$exe"$'\n'
+                ;;
+            php|php[0-9]*|php-fpm*|php-cgi*)
+                PROC_PHP_LIST="$PROC_PHP_LIST$exe"$'\n'
+                # 仅记录"跑脚本"的常驻进程（php-fpm master 无脚本参数，另行判定）
+                pid="${d#/proc/}"
+                cmd=$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null | cut -c1-200)
+                case "$cmd" in
+                    *".php"*) PROC_PHP_WORKERS="$PROC_PHP_WORKERS$pid|$cmd"$'\n' ;;
+                esac
+                ;;
+        esac
+    done
+    PROC_HTTPD_LIST=$(printf '%s' "$PROC_HTTPD_LIST" | grep -v '^$' | sort -u)
+    PROC_NGINX_LIST=$(printf '%s' "$PROC_NGINX_LIST" | grep -v '^$' | sort -u)
+    PROC_PHP_LIST=$(printf '%s' "$PROC_PHP_LIST" | grep -v '^$' | sort -u)
+    return 0
+}
+
+# 列出可读的 Apache 主配置文件（含一体化部署的非常规路径）
+apache_conf_files() {
+    ls /etc/httpd/conf/httpd.conf /etc/apache2/apache2.conf \
+       /usr/local/apache2/conf/httpd.conf /www/server/apache/conf/httpd.conf \
+       /opt/lampp/etc/httpd.conf /opt/*/etc/apache/httpd.conf \
+       /opt/*/etc/apache2/apache2.conf /opt/*/run/apache/conf/httpd.conf \
+       /opt/*/conf/httpd.conf 2>/dev/null | sort -u
+}
+
+# 由 httpd 二进制推断其主配置文件（/opt/<产品>/run/apache/httpd -> /opt/<产品>/etc/apache/httpd.conf）
+apache_primary_conf() {
+    local bin="$1" d c
+    case "$bin" in
+        */run/apache/*)
+            d="${bin%%/run/apache/*}"
+            if [ -f "$d/etc/apache/httpd.conf" ]; then
+                printf '%s' "$d/etc/apache/httpd.conf"
+                return 0
+            fi
+            ;;
+    esac
+    for c in $(apache_conf_files); do
+        printf '%s' "$c"
+        return 0
+    done
+    return 0
+}
+
+# 解析 Apache 配置中的 DocumentRoot 与 Alias 目标
+# （应用可能挂在 Alias 上，如 Alias /zentao -> /opt/zbox/app/zentao/www/）
+apache_web_roots() {
+    local conf
+    for conf in $(apache_conf_files); do
+        [ -r "$conf" ] || continue
+        grep -hiE '^[[:space:]]*DocumentRoot[[:space:]]' "$conf" 2>/dev/null \
+            | awk '{print $2}' | tr -d '"'
+        grep -hiE '^[[:space:]]*Alias[[:space:]]' "$conf" 2>/dev/null \
+            | awk '{print $NF}' | tr -d '"'
+    done
+    return 0
+}
+
+# php --ini 输出的 "Loaded Configuration File"（最可靠，覆盖任意自定义路径）
+php_ini_file() {
+    "$1" --ini 2>/dev/null | sed -n 's/^Loaded Configuration File:[[:space:]]*//p' | head -n1
+}
+
+# php --ini 输出的附加 ini 扫描目录（通常是 conf.d）
+php_ini_scan_dir() {
+    local d
+    d=$("$1" --ini 2>/dev/null | sed -n 's/^Scan for additional .ini files in:[[:space:]]*//p' | head -n1)
+    case "$d" in
+        "(none)"|"") return 0 ;;
+    esac
+    printf '%s' "$d"
+}
+
+# 可执行文件是否由发行版包管理器提供（0=属于软件包；1=厂商自带 / 源码编译）
+# 用途：7.4/8.0/8.1 上游已无修复版本，只有发行版回补一条路；
+#       不属于任何软件包就说明没有回补渠道，风险应上调。
+bin_is_packaged() {
+    local p="$1"
+    [ -n "$p" ] || return 1
+    case "$PM" in
+        rpm) rpm -qf "$p" >/dev/null 2>&1 ;;
+        deb) dpkg -S "$p" >/dev/null 2>&1 ;;
+        *)   return 1 ;;
+    esac
+}
+
+# 输出 php 二进制版本行
+# 注意：CLI 下 display_errors=On 时，加载扩展的告警（如 "Module 'xlswriter'
+#       already loaded"）会写到 stdout，排在版本行之前，甚至前面还有空行。
+#       直接 head -n1 会取到空行/告警行，导致版本判定为"读取失败"从而漏报整机
+#       （见 issue #13 实测：PHP 7.4.33 + 重复扩展告警）。
 php_bin_version() {
     local bin="$1"
-    "$bin" -v 2>/dev/null | head -n1
+    "$bin" -v 2>/dev/null | grep -m1 -E 'PHP[[:space:]]+[0-9]+\.[0-9]+'
 }
 
 # ini_get KEY FILE... -> 多个 ini 文件中最后一次出现的取值（后加载者覆盖前者）
@@ -481,6 +646,24 @@ is_demo_php_name() {
     return 1
 }
 
+# 文件是否位于已识别应用（如禅道）的目录树内
+# 禅道新版把入口控制器放在 www/x.php、www/index.php，与测试文件名黑名单重名；
+# 若不做应用目录识别，每个禅道站点都会各报一条中危误报（见 issue #13）
+in_known_app_tree() {
+    local d i
+    d=$(dirname "$1")
+    i=0
+    while [ -n "$d" ] && [ "$d" != "/" ] && [ "$i" -lt 4 ]; do
+        if { [ -f "$d/config/my.php" ] || [ -f "$d/config/config.php" ]; } \
+            && { [ -d "$d/module" ] || [ -d "$d/framework" ]; }; then
+            return 0
+        fi
+        d=$(dirname "$d")
+        i=$((i + 1))
+    done
+    return 1
+}
+
 # 对"命中文件名黑名单"的 PHP 文件做二次判定，输出：
 #   suspicious —— 含 phpinfo()/命令执行等可疑调用，属真正的信息泄露/攻击面
 #   bundled    —— 应用自带文件（核心/依赖/插件主文件），不应报风险
@@ -499,7 +682,12 @@ classify_demo_file() {
         | grep -qiE '(phpinfo|eval|assert|system|shell_exec|passthru|proc_open|popen|exec)[[:space:]]*\('; then
         printf 'suspicious'; return 0
     fi
-    # 3) 带插件/包声明头文件特征，判定为应用自带
+    # 3) 已识别应用目录树内的文件视为应用自带
+    #    注意放在可疑调用判定之后：被植入的命令执行文件仍优先报 suspicious
+    if in_known_app_tree "$f"; then
+        printf 'bundled'; return 0
+    fi
+    # 4) 带插件/包声明头文件特征，判定为应用自带
     if grep -qiE 'Plugin Name:|@package|@author|@version|namespace[[:space:]]+[A-Za-z_\\]' "$f" 2>/dev/null; then
         printf 'bundled'; return 0
     fi
@@ -633,7 +821,18 @@ check_changelog_backport() {
 scan_php_runtime() {
     section "3. PHP 运行时版本判定"
     local bins
-    bins=$( (find_php_bins; find_php_bins_systemd) | sort -u)
+    # issue #13：一体化部署（禅道 zbox 等）的 PHP 既不在 PATH 也不注册 systemd，
+    # 必须先做进程反查，find_php_bins 内部已调用 proc_cache_build
+    proc_cache_build
+    # 同一个 PHP 二进制常以软链暴露多个路径（禅道 zbox：/opt/zbox/bin/php ->
+    # /opt/zbox/run/php/php），按真实路径去重，否则同一版本会被重复报为多条风险
+    bins=$( (find_php_bins; find_php_bins_systemd) \
+            | while IFS= read -r b; do
+                  [ -n "$b" ] || continue
+                  r=$(readlink -f "$b" 2>/dev/null)
+                  printf '%s\n' "${r:-$b}"
+              done | sort -u)
+    PHP_BINS_FOUND="$bins"
     if [ -z "$bins" ]; then
         if [ "$IS_ROOT" -eq 1 ]; then
             info "PHP" "未发现 PHP 可执行文件（已 root 权限全盘搜索，本机无 PHP 运行时，不存在 PHP2Shell 暴露面）"
@@ -671,6 +870,26 @@ scan_php_runtime() {
         med "PHP" "系统内存在多个 PHP 版本共存：$(printf '%s' "$uniq_vers" | tr '\n' ' ')，不同服务可能使用不同版本，易遗漏"
     fi
     log INFO "PHP" "版本集合: $(printf '%s' "$uniq_vers" | tr '\n' ' ')"
+
+    # 常驻 PHP 应用进程（RoadRunner、队列 worker 等）
+    # 这类进程长期持有全局状态，是 CVE-2026-109619（陈旧全局状态 UAF）的直接暴露面，
+    # 且修复后必须重启进程才生效（不能只换二进制）
+    local w nw
+    nw=$(printf '%s\n' "$PROC_PHP_WORKERS" | grep -c '[^[:space:]]')
+    if [ -n "$PROC_PHP_WORKERS" ] && [ "$nw" -gt 0 ]; then
+        log INFO "PHP" "常驻 PHP 应用进程（$nw 个）:"
+        IFS=$'\n'
+        for w in $PROC_PHP_WORKERS; do
+            log INFO "PHP" "  pid=${w%%|*}  ${w#*|}"
+        done
+        IFS="$oldifs"
+        add_topic "worker_restart"
+        if [ "$VULN_FOUND" -eq 1 ]; then
+            med "PHP" "存在 $nw 个常驻 PHP 应用进程（RoadRunner / 队列 worker 等），长期持有全局状态，CVE-2026-109619（陈旧全局状态 UAF）暴露面更大；升级 PHP 后必须重启这些进程才会生效"
+        else
+            info "PHP" "存在 $nw 个常驻 PHP 应用进程（RoadRunner / 队列 worker 等），升级 PHP 后需一并重启"
+        fi
+    fi
 }
 
 #===============================================================================
@@ -727,20 +946,44 @@ scan_extra_cves() {
 #===============================================================================
 scan_web_server() {
     section "5. Web 服务与 LAMP 组件"
+    proc_cache_build
     local found_web=0
     local oldifs="$IFS"
     IFS=$'\n'
 
     # Apache
+    # issue #13：三级探测 —— PATH -> 静态绝对路径 -> 运行进程反查
+    # 禅道 zbox 等一体化部署的 httpd 在 /opt/<产品>/run/apache/ 下，不进 PATH
     local httpd="" c
     for c in httpd apache2 apache; do
         if have "$c"; then httpd="$c"; break; fi
     done
+    if [ -z "$httpd" ]; then
+        for c in /usr/sbin/httpd /usr/sbin/apache2 /usr/local/apache2/bin/httpd \
+                 /www/server/apache/bin/httpd /opt/lampp/bin/httpd \
+                 /opt/*/run/apache/httpd /opt/*/bin/httpd; do
+            [ -x "$c" ] && { httpd="$c"; break; }
+        done
+    fi
+    if [ -z "$httpd" ] && [ -n "$PROC_HTTPD_LIST" ]; then
+        httpd=$(printf '%s\n' "$PROC_HTTPD_LIST" | head -n1)
+        log INFO "WEB" "Apache 由运行进程反查定位（不在 PATH）：$httpd"
+    fi
     if [ -n "$httpd" ]; then
         found_web=1
         log INFO "WEB" "Apache: $httpd -> $("$httpd" -v 2>/dev/null | head -n1)"
-        local mods
+        local mods conf
+        conf=$(apache_primary_conf "$httpd")
+        [ -n "$conf" ] && log INFO "WEB" "Apache 主配置: $conf"
         mods=$("$httpd" -M 2>/dev/null | grep -iE 'php')
+        if [ -z "$mods" ] && [ -n "$conf" ]; then
+            mods=$("$httpd" -f "$conf" -M 2>/dev/null | grep -iE 'php')
+        fi
+        if [ -z "$mods" ] && [ -n "$conf" ]; then
+            # -M 需要可用的 httpd 运行时环境（部分一体化包不满足），退回直接读配置
+            mods=$(grep -hiE '^[[:space:]]*LoadModule[[:space:]]+php' "$conf" 2>/dev/null)
+            [ -n "$mods" ] && mods="$(printf '%s' "$mods")（来源：配置文件 LoadModule 行）"
+        fi
         if [ -n "$mods" ]; then
             MODPHP_FOUND=1
             add_topic "mod_php"
@@ -755,25 +998,34 @@ scan_web_server() {
         else
             log INFO "WEB" "Apache 未直接加载 mod_php（可能经 php-fpm 反代）"
         fi
-        # 常见 mod_php 配置文件存在性
-        if ls /etc/httpd/conf.modules.d/*php* /etc/apache2/mods-enabled/*php* >/dev/null 2>&1; then
+        # 常见 mod_php 配置文件存在性（仅在模块列表未检出时作为补充判断）
+        if [ -z "$mods" ] && ls /etc/httpd/conf.modules.d/*php* /etc/apache2/mods-enabled/*php* \
+              /opt/*/etc/apache/conf.d/*php* /opt/*/etc/apache2/mods-enabled/*php* \
+              /www/server/apache/conf/extra/*php* >/dev/null 2>&1; then
             add_topic "mod_php"
-            med "WEB" "存在 mod_php 启用配置：$(ls /etc/httpd/conf.modules.d/*php* /etc/apache2/mods-enabled/*php* 2>/dev/null | tr '\n' ' ')"
+            med "WEB" "存在 mod_php 启用配置：$(ls /etc/httpd/conf.modules.d/*php* /etc/apache2/mods-enabled/*php* /opt/*/etc/apache/conf.d/*php* /opt/*/etc/apache2/mods-enabled/*php* /www/server/apache/conf/extra/*php* 2>/dev/null | tr '\n' ' ')"
         fi
     else
         log INFO "WEB" "未发现 Apache"
     fi
 
-    # nginx
+    # nginx（同样支持进程反查，覆盖面板/一体化部署）
+    local nginx_bin=""
     if have nginx; then
+        nginx_bin="nginx"
+    elif [ -n "$PROC_NGINX_LIST" ]; then
+        nginx_bin=$(printf '%s\n' "$PROC_NGINX_LIST" | head -n1)
+        log INFO "WEB" "nginx 由运行进程反查定位（不在 PATH）：$nginx_bin"
+    fi
+    if [ -n "$nginx_bin" ]; then
         found_web=1
-        log INFO "WEB" "nginx: $(nginx -v 2>&1 | head -n1)"
+        log INFO "WEB" "nginx: $("$nginx_bin" -v 2>&1 | head -n1)"
         local nroot
-        nroot=$(grep -rhoE '^[[:space:]]*root[[:space:]]+[^;]+;' /etc/nginx /usr/local/nginx/conf 2>/dev/null | awk '{print $2}' | tr -d ';' | sort -u)
+        nroot=$(grep -rhoE '^[[:space:]]*root[[:space:]]+[^;]+;' /etc/nginx /usr/local/nginx/conf /www/server/nginx/conf /opt/*/etc/nginx 2>/dev/null | awk '{print $2}' | tr -d ';' | sort -u)
         [ -n "$nroot" ] && log INFO "WEB" "nginx root 指令: $(printf '%s' "$nroot" | tr '\n' ' ')"
-        if grep -rq 'fastcgi_pass' /etc/nginx /usr/local/nginx/conf 2>/dev/null; then
+        if grep -rq 'fastcgi_pass' /etc/nginx /usr/local/nginx/conf /www/server/nginx/conf /opt/*/etc/nginx 2>/dev/null; then
             local fpm_addr
-            fpm_addr=$(grep -rhoE 'fastcgi_pass[[:space:]]+[^;]+;' /etc/nginx /usr/local/nginx/conf 2>/dev/null | tr -d ';' | sort -u | tr '\n' ' ')
+            fpm_addr=$(grep -rhoE 'fastcgi_pass[[:space:]]+[^;]+;' /etc/nginx /usr/local/nginx/conf /www/server/nginx/conf /opt/*/etc/nginx 2>/dev/null | tr -d ';' | sort -u | tr '\n' ' ')
             log INFO "WEB" "nginx 通过 fastcgi_pass 转发至 PHP-FPM: $fpm_addr"
         fi
     else
@@ -847,12 +1099,45 @@ scan_web_server() {
 scan_php_config() {
     section "6. PHP 配置暴露面检查"
     local inis ini overrides
-    inis=$(ls /etc/php.ini /etc/php/*/php.ini /etc/php/*/cli/php.ini /etc/php/*/fpm/php.ini \
-              /etc/php/*/apache2/php.ini /usr/local/lib/php.ini /usr/local/etc/php/php.ini \
-              /opt/php*/etc/php.ini /usr/local/php*/lib/php.ini 2>/dev/null | sort -u)
+
+    # issue #13：一体化部署（禅道 zbox 等）的 php.ini 不在任何标准路径，
+    # 优先用第 3 节实际发现的 PHP 可执行文件自报的 `php --ini` 结果定位
+    local dyn_inis="" dyn_dirs="" pb ifile idir
+    local oldifs3="$IFS"
+    IFS=$'\n'
+    for pb in $PHP_BINS_FOUND; do
+        [ -x "$pb" ] || continue
+        ifile=$(php_ini_file "$pb")
+        case "$ifile" in
+            ""|"(none)") ;;
+            *) dyn_inis="$dyn_inis$ifile"$'\n' ;;
+        esac
+        idir=$(php_ini_scan_dir "$pb")
+        [ -n "$idir" ] && [ -d "$idir" ] && dyn_dirs="$dyn_dirs$idir"$'\n'
+    done
+    IFS="$oldifs3"
+    if [ -n "$dyn_inis" ]; then
+        log INFO "CFG" "PHP 自报配置文件（php --ini）: $(printf '%s' "$dyn_inis" | sort -u | tr '\n' ' ')"
+    fi
+
+    inis=$(
+        {
+            ls /etc/php.ini /etc/php/*/php.ini /etc/php/*/cli/php.ini /etc/php/*/fpm/php.ini \
+               /etc/php/*/apache2/php.ini /usr/local/lib/php.ini /usr/local/etc/php/php.ini \
+               /opt/php*/etc/php.ini /usr/local/php*/lib/php.ini \
+               /opt/*/etc/php/php.ini /opt/*/run/php/etc/php.ini /opt/lampp/etc/php.ini \
+               /www/server/php/*/etc/php.ini 2>/dev/null
+            printf '%s' "$dyn_inis"
+        } | grep -v '^$' | sort -u)
     # Debian/Ubuntu 的 conf.d/*.ini 会在 php.ini 之后加载，可覆盖关键配置
-    overrides=$(ls /etc/php/*/conf.d/*.ini /etc/php/*/*/conf.d/*.ini \
-                   /usr/local/etc/php/conf.d/*.ini /usr/local/php*/conf.d/*.ini 2>/dev/null | sort -u)
+    overrides=$(
+        {
+            ls /etc/php/*/conf.d/*.ini /etc/php/*/*/conf.d/*.ini \
+               /usr/local/etc/php/conf.d/*.ini /usr/local/php*/conf.d/*.ini \
+               /opt/*/etc/php/conf.d/*.ini /opt/*/run/php/etc/conf.d/*.ini \
+               /opt/lampp/etc/conf.d/*.ini /www/server/php/*/etc/conf.d/*.ini 2>/dev/null
+            for idir in $dyn_dirs; do ls "$idir"/*.ini 2>/dev/null; done
+        } | grep -v '^$' | sort -u)
 
     if [ -z "$inis" ] && [ -z "$overrides" ]; then
         info "CFG" "未找到 php.ini（可能在容器内或非常规路径）"
@@ -874,6 +1159,14 @@ scan_php_config() {
     for f in $files; do
         [ -r "$f" ] || continue
         log INFO "CFG" "-- $f --"
+        # conf.d 里的扩展 ini（如 00-ioncube.ini / 01-opcache.ini）只负责加载扩展，
+        # 不会设置 memory_limit / post_max_size / session.upload_progress；
+        # 这些指令由主 php.ini 统一决定。对扩展 ini 只校验它显式写入的值，
+        # 否则每个扩展文件都会各报一次"未设置"，产生成倍误报。
+        local is_main=1
+        case "$f" in
+            */conf.d/*|*/conf.d) is_main=0 ;;
+        esac
 
         # display_errors / expose_php —— 通用加固项，非 PHP2Shell 缓解措施
         local de ep deb epb
@@ -903,9 +1196,11 @@ scan_php_config() {
         elif [ -n "$ml" ]; then
             add_topic "memlimit"
             med "CFG" "$f: memory_limit=$ml，存在可由请求方稳定触发的 longjmp 中止路径；官方要求设为 -1（应用不可覆盖）以移除该路径"
-        else
+        elif [ "$is_main" -eq 1 ]; then
             add_topic "memlimit"
             med "CFG" "$f: 未显式设置 memory_limit（将采用默认 128M），官方要求设为 -1 以移除可控的 OOM 中止路径"
+        else
+            log INFO "CFG" "$f: 未设置 memory_limit（扩展 ini，由主 php.ini 决定）"
         fi
 
         # OPcache —— 官方缓解措施中未包含"关闭 OPcache"，仅作为暴露面提示
@@ -930,9 +1225,11 @@ scan_php_config() {
             med "CFG" "$f: session.upload_progress.enabled=${sup}，官方缓解措施未落实（CVE-2026-109619：应设为 0 并重启所有 worker）"
         elif [ "$supb" = "0" ]; then
             ok "CFG" "$f: session.upload_progress.enabled=${sup}，符合 CVE-2026-109619 官方缓解措施"
-        else
+        elif [ "$is_main" -eq 1 ]; then
             add_topic "upload_progress"
             med "CFG" "$f: 未显式设置 session.upload_progress.enabled（PHP 默认值为 1/On），官方缓解措施未落实（CVE-2026-109619：应设为 0 并重启所有 worker）"
+        else
+            log INFO "CFG" "$f: 未设置 session.upload_progress.enabled（扩展 ini，由主 php.ini 决定）"
         fi
 
         # post_max_size —— CVE-2026-109618 官方缓解措施（收紧请求体）
@@ -1112,11 +1409,10 @@ collect_web_roots() {
     local r d out
     out=$(
         {
-            # Apache DocumentRoot
-            grep -rhoiE '^[[:space:]]*DocumentRoot[[:space:]]+"[^"]+"' /etc/httpd /etc/apache2 /usr/local/apache2 2>/dev/null \
-                | sed -E 's/.*"([^"]+)".*/\1/'
+            # Apache DocumentRoot + Alias 目标（issue #13：禅道 zbox 用 Alias /zentao 指向应用目录）
+            apache_web_roots
             # nginx root
-            grep -rhoiE '^[[:space:]]*root[[:space:]]+[^;]+;' /etc/nginx /usr/local/nginx/conf 2>/dev/null \
+            grep -rhoiE '^[[:space:]]*root[[:space:]]+[^;]+;' /etc/nginx /usr/local/nginx/conf /www/server/nginx/conf /opt/*/etc/nginx 2>/dev/null \
                 | awk '{print $2}' | tr -d ';'
             # 常见默认值
             echo /var/www/html
@@ -1127,6 +1423,11 @@ collect_web_roots() {
             echo /home/www
             echo /www/wwwroot
             echo /opt/app
+            # 一体化部署常见布局（禅道 zbox / XAMPP / 面板）
+            echo /opt/*/app/*/www
+            echo /opt/*/app/*/htdocs
+            echo /opt/*/htdocs
+            echo /opt/lampp/htdocs
             # 用户附加
             for r in $EXTRA_ROOTS; do echo "$r"; done
         } | sed 's|/*$|/|' | sort -u
@@ -1186,6 +1487,27 @@ detect_cms() {
     [ -f "$root/config.php" ] && [ -s "$root/config.php" ] && [ -d "$root/sites" ] && out="$out Drupal(config)"
     [ -d "$root/Discuz" ] && [ -n "$(ls -A "$root/Discuz" 2>/dev/null | head -n1)" ] && out="$out Discuz"
     [ -f "$root/index.php" ] && [ -d "$root/admin" ] && [ -n "$(ls -A "$root/admin" 2>/dev/null | head -n1)" ] && out="$out 后台管理类应用"
+
+    # 禅道 ZenTao（issue #13）：www/ 的上级目录为应用根，
+    # 含 config/my.php 且（module/ 或 framework/）。版本号在应用根的 VERSION
+    # 或一体化部署根目录（如 /opt/zbox/VERSION）下。
+    local up zver
+    up="${root%/}/.."
+    if { [ -f "$up/config/my.php" ] || [ -f "$up/config/config.php" ]; } \
+        && { [ -d "$up/module" ] || [ -d "$up/framework" ]; }; then
+        zver=""
+        if [ -f "$up/VERSION" ]; then
+            zver=$(head -n1 "$up/VERSION" 2>/dev/null)
+        elif [ -f "$up/../../VERSION" ]; then
+            zver=$(head -n1 "$up/../../VERSION" 2>/dev/null)
+        fi
+        if [ -n "$zver" ]; then
+            out="$out ZenTao禅道($zver)"
+        else
+            out="$out ZenTao禅道"
+        fi
+    fi
+
     printf '%s' "$out" | tr -s ' ' | sed 's/^ //'
     return 0
 }
@@ -1386,6 +1708,19 @@ print_remediation() {
         printf '    %s. [必做] 存在无官方修复发行版的分支（7.4/8.0/8.1），需向发行版确认是否已回补 CVE-2026-109618/109619\n' "$n"
         _log_target "  $n. [必做] 确认发行版是否已回补 CVE-2026-109618/109619"
     fi
+    if has_topic "vendor_php"; then
+        n=$((n+1))
+        printf '    %s. [必做] 存在厂商自带 / 源码编译的 PHP（不属于任何发行版软件包），7.4/8.0/8.1 分支\n' "$n"
+        printf '         没有发行版回补渠道：需向该产品厂商索取已修复 CVE-2026-109618/109619 的版本，\n'
+        printf '         或自行编译升级到 8.2.35 / 8.3.36 / 8.4.27 / 8.5.12 及以上。\n'
+        _log_target "  $n. [必做] 厂商自带/源码编译 PHP 无回补渠道，需厂商修复或自行升级"
+    fi
+    if has_topic "worker_restart"; then
+        n=$((n+1))
+        printf '    %s. [必做] 修复后重启所有常驻 PHP 应用进程（RoadRunner / 队列 worker 等）：\n' "$n"
+        printf '         仅替换二进制或重启 Web 服务不会清掉这些进程内已存在的陈旧全局状态。\n'
+        _log_target "  $n. [必做] 重启常驻 PHP 应用进程（RoadRunner / 队列 worker）"
+    fi
     if has_topic "docker_rebuild"; then
         n=$((n+1))
         printf '    %s. [必做] 将所有 PHP Docker 镜像重建为已修复基础镜像，并重新部署相关容器\n' "$n"
@@ -1482,9 +1817,9 @@ print_remediation() {
 # 主流程
 #===============================================================================
 main() {
-    printf '%s\n' "$C_BLD==== PHP2Shell 漏洞风险扫描 (PHP2Shell Scan) v3.1.0 ====$C_OFF"
+    printf '%s\n' "$C_BLD==== PHP2Shell 漏洞风险扫描 (PHP2Shell Scan) v3.2.0 ====$C_OFF"
     log INFO "SCAN" "开始时间 $(date '+%Y-%m-%d %H:%M:%S')"
-    log INFO "SCAN" "主机 $(hostname 2>/dev/null)  执行身份 $(id -un 2>/dev/null)  扫描器版本 3.1.0"
+    log INFO "SCAN" "主机 $(hostname 2>/dev/null)  执行身份 $(id -un 2>/dev/null)  扫描器版本 3.2.0"
     log INFO "SCAN" "报告文件: $REPORT_FILE"
     log INFO "SCAN" "漏洞参考: CVE-2026-109618 (OOM 内存破坏) / CVE-2026-109619 (陈旧全局状态 UAF)"
 
