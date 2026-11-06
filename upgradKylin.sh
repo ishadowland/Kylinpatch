@@ -295,8 +295,73 @@ if [ ${PIPESTATUS[0]} -ne 0 ]; then
 fi
 log "INFO" "升级完成"
 
+# ============================================================
+# 停止 PolarDB-X (polardbx) 服务
+# ============================================================
+# 背景：polardbx 是数据库服务。重启前若不先正常停止，重启后会走 crash recovery，
+#      可能出现数据不一致；先停服务让数据干净落盘，再 sync 刷盘，最后重启。
+# 兼容：systemd（list-unit-files + list-units）+ SysV init 脚本兜底（CentOS 7 等）
+# 返回：0=已找到并处理；1=未找到服务（无需处理）
+POLARDBX_STOPPED=""
+stop_polardbx_service() {
+    local units=""
+    local init_scripts=""
+    local u
+    local stopped=""
+    local failed=""
+
+    # systemd：先扫 unit 文件（覆盖已安装未启用的），再扫运行中的 unit
+    if command -v systemctl >/dev/null 2>&1; then
+        units=$(systemctl list-unit-files --type=service --no-legend --no-pager 2>/dev/null \
+                 | awk '{print $1}' | grep -i 'polardbx')
+        if [ -z "$units" ]; then
+            units=$(systemctl list-units --type=service --all --no-legend --no-pager 2>/dev/null \
+                     | awk '{print $1}' | grep -i 'polardbx')
+        fi
+    fi
+
+    # SysV init 脚本兜底
+    if [ -z "$units" ]; then
+        for f in /etc/init.d/polardbx*; do
+            [ -e "$f" ] && init_scripts="$init_scripts $(basename "$f")"
+        done
+    fi
+
+    if [ -z "$units" ] && [ -z "$init_scripts" ]; then
+        log "INFO" "未检测到 polardbx 服务，跳过停止"
+        return 1
+    fi
+
+    for u in $units; do
+        if systemctl stop "$u" >> "$LOG_FILE" 2>&1; then
+            log "INFO" "已停止服务: $u"
+            stopped="$stopped $u"
+        else
+            log "WARNING" "停止服务失败: $u（继续执行，请确认数据已落盘后再重启）"
+            failed="$failed $u"
+        fi
+    done
+
+    for u in $init_scripts; do
+        if service "$u" stop >> "$LOG_FILE" 2>&1; then
+            log "INFO" "已停止服务(SysV): $u"
+            stopped="$stopped $u"
+        else
+            log "WARNING" "停止服务失败(SysV): $u（继续执行，请确认数据已落盘后再重启）"
+            failed="$failed $u"
+        fi
+    done
+
+    POLARDBX_STOPPED="$stopped"
+    [ -n "$stopped" ] && log "INFO" "polardbx 服务停止完成:$stopped"
+    [ -n "$failed" ] && log "WARNING" "以下 polardbx 服务未能停止:$failed"
+    return 0
+}
+
 # 11. 重启确认
 log "INFO" "### 步骤 10: 重启系统..."
+log "INFO" "检查并停止 polardbx 服务（若存在）..."
+stop_polardbx_service
 log "INFO" "执行sync命令强制写入缓存(重复5次)..."
 sync && sync && sync && sync && sync
 
@@ -315,6 +380,9 @@ case "$restart_confirm" in
         log "WARNING" "请手动重启以完成升级"
         log "INFO" "清理命令: rm -rf $TARGET_DIR"
         log "INFO" "恢复YUM源: mv $BACKUP_DIR/* /etc/yum.repos.d/"
+        if [ -n "$POLARDBX_STOPPED" ]; then
+            log "WARNING" "polardbx 服务已停止但本次未重启，请手工拉起: systemctl start $POLARDBX_STOPPED"
+        fi
         log "INFO" "脚本执行完毕，未重启系统"
         ;;
 esac
