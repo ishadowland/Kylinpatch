@@ -303,10 +303,37 @@ log "INFO" "升级完成"
 # 兼容：systemd（list-unit-files + list-units）+ SysV init 脚本兜底（CentOS 7 等）
 # 返回：0=已找到并处理；1=未找到服务（无需处理）
 POLARDBX_STOPPED=""
+
+# 停止服务的超时时间（秒）。
+# systemd 默认 TimeoutStopSec=90s，超时后会 SIGKILL 强杀进程——对数据库而言这恰恰是最坏情况：
+# 进程被强杀，下次启动照样走 crash recovery，"先干净停库"就白做了。这里放宽到 300s。
+POLARDBX_STOP_TIMEOUT=300
+
+# 计算指定单元停止时应使用的超时（秒）。
+# 取单元自身的 TimeoutStopUSec 与默认值的较大者，避免 --timeout 反而把单元原本更长的
+# 超时上限改短。取不到有效数值时（老 systemd 的人类可读格式 / infinity / 单元不存在），
+# 返回空表示不传 --timeout，保持单元原有行为不变。
+_stop_timeout_arg() {
+    local unit="$1"
+    local usec sec
+    usec=$(systemctl show "$unit" -p TimeoutStopUSec 2>/dev/null | head -n1 | cut -d= -f2)
+    case "$usec" in
+        ''|*[!0-9]*)
+            printf ''
+            ;;
+        *)
+            sec=$((usec / 1000000))
+            [ "$sec" -lt "$POLARDBX_STOP_TIMEOUT" ] && sec=$POLARDBX_STOP_TIMEOUT
+            printf '%s' "$sec"
+            ;;
+    esac
+}
+
 stop_polardbx_service() {
     local units=""
     local init_scripts=""
     local u
+    local tmo
     local stopped=""
     local failed=""
 
@@ -333,12 +360,25 @@ stop_polardbx_service() {
     fi
 
     for u in $units; do
-        if systemctl stop "$u" >> "$LOG_FILE" 2>&1; then
-            log "INFO" "已停止服务: $u"
-            stopped="$stopped $u"
+        tmo=$(_stop_timeout_arg "$u")
+        if [ -n "$tmo" ]; then
+            log "INFO" "停止服务: $u（超时 ${tmo}s）"
+            if systemctl stop --timeout="$tmo" "$u" >> "$LOG_FILE" 2>&1; then
+                log "INFO" "已停止服务: $u"
+                stopped="$stopped $u"
+            else
+                log "WARNING" "停止服务失败: $u（继续执行，请确认数据已落盘后再重启）"
+                failed="$failed $u"
+            fi
         else
-            log "WARNING" "停止服务失败: $u（继续执行，请确认数据已落盘后再重启）"
-            failed="$failed $u"
+            log "INFO" "停止服务: $u（未获取到超时配置，使用单元默认值）"
+            if systemctl stop "$u" >> "$LOG_FILE" 2>&1; then
+                log "INFO" "已停止服务: $u"
+                stopped="$stopped $u"
+            else
+                log "WARNING" "停止服务失败: $u（继续执行，请确认数据已落盘后再重启）"
+                failed="$failed $u"
+            fi
         fi
     done
 
@@ -360,29 +400,39 @@ stop_polardbx_service() {
 
 # 11. 重启确认
 log "INFO" "### 步骤 10: 重启系统..."
-log "INFO" "检查并停止 polardbx 服务（若存在）..."
-stop_polardbx_service
-log "INFO" "执行sync命令强制写入缓存(重复5次)..."
-sync && sync && sync && sync && sync
 
 read -p "是否立即重启系统？(y/n): " restart_confirm
 case "$restart_confirm" in
     y|Y)
+        # 重启前的准备，顺序不可调换：
+        #   1) 先正常停止 polardbx，让数据库自己完成一次干净刷盘
+        #   2) 再 sync 把剩余缓存刷到磁盘
+        #   3) 最后重启
+        # sync 必须排在停库之后，否则重启后数据库仍会走 crash recovery。
+        log "INFO" "检查并停止 polardbx 服务（若存在）..."
+        stop_polardbx_service
+        log "INFO" "执行sync命令强制写入缓存(重复5次)..."
+        sync && sync && sync && sync && sync
         log "INFO" "系统将在10秒后重启..."
         for i in {10..1}; do
             echo -ne "倒计时: $i 秒\r"
             sleep 1
         done
         log "INFO" "正在重启系统..."
-        reboot
+        if ! reboot; then
+            log "ERROR" "重启命令执行失败，系统未重启"
+            if [ -n "$POLARDBX_STOPPED" ]; then
+                log "WARNING" "polardbx 服务已停止但系统未重启，请手工拉起: systemctl start ${POLARDBX_STOPPED# }"
+            fi
+        fi
         ;;
     *)
         log "WARNING" "请手动重启以完成升级"
         log "INFO" "清理命令: rm -rf $TARGET_DIR"
         log "INFO" "恢复YUM源: mv $BACKUP_DIR/* /etc/yum.repos.d/"
-        if [ -n "$POLARDBX_STOPPED" ]; then
-            log "WARNING" "polardbx 服务已停止但本次未重启，请手工拉起: systemctl start $POLARDBX_STOPPED"
-        fi
+        log "INFO" "本次未重启，polardbx 服务未停止，数据库保持运行状态"
+        log "INFO" "执行sync命令强制写入缓存(重复5次)..."
+        sync && sync && sync && sync && sync
         log "INFO" "脚本执行完毕，未重启系统"
         ;;
 esac
